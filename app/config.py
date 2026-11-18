@@ -13,6 +13,10 @@ class Settings:
         self.area_tol_rel: float = float(os.getenv("AREA_TOL_REL", "1e-9"))
         # 点查询边界兜底距离 = 该系数 × 流域外接矩形对角线
         self.point_eps_rel: float = float(os.getenv("POINT_EPS_REL", "1e-9"))
+        # 河道线重叠判定容差 = 该系数 × 较短线段长度
+        self.line_overlap_tol_rel: float = float(
+            os.getenv("LINE_OVERLAP_TOL_REL", "1e-9")
+        )
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
 
 

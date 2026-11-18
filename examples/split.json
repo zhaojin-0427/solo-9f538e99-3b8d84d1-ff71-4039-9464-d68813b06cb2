@@ -1,0 +1,26 @@
+{
+  "version": null,
+  "rivers": [
+    {
+      "river_id": "diag",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[0, 0], [4, 4]]
+      }
+    },
+    {
+      "river_id": "shared-edge",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[2, 0], [2, 4]]
+      }
+    },
+    {
+      "river_id": "outside",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[9, 9], [10, 10]]
+      }
+    }
+  ]
+}

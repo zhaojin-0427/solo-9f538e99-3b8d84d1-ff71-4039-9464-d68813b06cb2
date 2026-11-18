@@ -5,24 +5,40 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import settings
-from .db import Database, VersionConflict, VersionNotFound
-from .geometry import GeometryError, classify_point, parse_surface, validate_submission
+from .db import Database, VersionConflict
+from .geometry import (
+    GeometryError,
+    classify_point,
+    parse_line,
+    parse_surface,
+    split_line_by_grids,
+    validate_lines,
+    validate_submission,
+)
 from .schemas import (
+    InsidePiece,
+    OutsidePiece,
     PointResult,
     PublishRequest,
     PublishResponse,
     QueryRequest,
     QueryResponse,
+    RiverSplitResult,
+    SplitRequest,
+    SplitResponse,
+    PendingPiece,
     VersionInfo,
 )
+from shapely.geometry import mapping
+from shapely.geometry.base import BaseGeometry
 
 app = FastAPI(
     title="流域防汛网格服务",
     description=(
         "提交流域多边形与整版网格（互不重叠且恰好覆盖流域），按所见版号乐观锁发布；"
-        "观测点按固定版号批量落格，旧版持久保留可查。"
+        "观测点按固定版号批量落格，河道中心线按固定版号逐网格切分，旧版持久保留可查。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 db = Database(settings.database_path)
@@ -148,3 +164,94 @@ async def query(req: QueryRequest) -> JSONResponse | QueryResponse:
         )
 
     return QueryResponse(version=version, is_current=(version == current), results=results)
+
+
+def _geojson(geom: BaseGeometry) -> dict:
+    return mapping(geom)
+
+
+@app.post(
+    "/split",
+    response_model=SplitResponse,
+    tags=["切分"],
+    responses={
+        404: {"model": dict, "description": "指定版本不存在或尚无已发布版本"},
+        422: {"model": dict, "description": "河道线非法 / 编号重复 / 自交或互相重叠，整次拒绝"},
+    },
+)
+async def split(req: SplitRequest) -> JSONResponse | SplitResponse:
+    # 1) 先做全部输入校验：任何一条线非法都整次拒绝，不产生部分结果
+    rivers: list[tuple[str, object]] = []
+    seen_ids: set[str] = set()
+    duplicates: list[str] = []
+    for river in req.rivers:
+        if river.river_id in seen_ids and river.river_id not in duplicates:
+            duplicates.append(river.river_id)
+        seen_ids.add(river.river_id)
+        geom = parse_line(river.geometry, f"河道 {river.river_id}")
+        rivers.append((river.river_id, geom))
+    if duplicates:
+        return _error(
+            422,
+            "DUPLICATE_RIVER_ID",
+            f"河道编号必须唯一，重复编号：{', '.join(duplicates)}",
+        )
+    validate_lines(rivers, settings.line_overlap_tol_rel)
+
+    # 2) 解析版号并一次性加载该版快照；之后全部计算只基于内存中的同一快照，
+    #    计算期间即使有新发布，结果也不会与版号错配
+    current = db.current_version()
+    if req.version is None:
+        if current is None:
+            return _error(404, "NO_PUBLISHED_VERSION", "尚无已发布版本，请先调用 /publish")
+        version = current
+    else:
+        version = req.version
+        if not any(v["version"] == version for v in db.list_versions()):
+            return _error(404, "VERSION_NOT_FOUND", f"版本 {version} 不存在")
+
+    _watershed, grids = db.load_snapshot(version)
+    diag = max(
+        _watershed.bounds[2] - _watershed.bounds[0],
+        _watershed.bounds[3] - _watershed.bounds[1],
+    )
+    eps = diag * settings.point_eps_rel
+
+    # 3) 逐条按网格裁切（输入已整体通过校验，此处不再可能出现部分失败）
+    results: list[RiverSplitResult] = []
+    for river_id, line in rivers:
+        outcome = split_line_by_grids(line, grids, eps)
+        inside_pieces = [
+            InsidePiece(
+                grid_id=grid_id,
+                geometry=_geojson(piece),
+                length=piece.length,
+            )
+            for grid_id, pieces in outcome["inside"].items()
+            for piece in pieces
+        ]
+        pending_pieces = [
+            PendingPiece(
+                geometry=_geojson(item["geometry"]),
+                length=item["geometry"].length,
+                grid_ids=item["grid_ids"],
+            )
+            for item in outcome["pending"]
+        ]
+        outside_pieces = [
+            OutsidePiece(geometry=_geojson(piece), length=piece.length)
+            for piece in outcome["outside"]
+        ]
+        results.append(
+            RiverSplitResult(
+                river_id=river_id,
+                source_length=line.length,
+                inside=inside_pieces,
+                pending=pending_pieces,
+                outside=outside_pieces,
+            )
+        )
+
+    return SplitResponse(
+        version=version, is_current=(version == current), results=results
+    )
